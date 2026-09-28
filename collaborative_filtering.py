@@ -6,6 +6,7 @@
 # Saras AI Institute | Build Predictive Models & Modern Recommenders
 # =============================================================================
 
+import os
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -14,6 +15,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import normalize
 import pickle
 import warnings
+
 warnings.filterwarnings('ignore')
 
 print("=" * 60)
@@ -38,7 +40,7 @@ event_weights = {
 }
 
 # TODO: Map your defined event weights dictionary onto the events['event'] column to populate a new column 'weight'
-events['weight'] = events['event'].map(event_weights).fillna(0).astype(np.float32)
+events['weight'] = events['event'].map(event_weights).fillna(0)
 
 print(f"    Total events    : {len(events):,}")
 
@@ -51,7 +53,7 @@ interactions = (
     .sum()
 )
 
-print(f"    Unique user-item pairs: {len(interactions) if interactions is not None else 0:,}")
+print(f"    Unique user-item pairs: {len(interactions):,}")
 
 
 # ---------------------------------------------------------------------------
@@ -65,35 +67,27 @@ item_ids = interactions['itemid'].unique()
 
 # TODO: Generate continuous coordinate index maps (dictionaries) for users and items
 # Format: {raw_id: coordinate_index_integer}
-user_to_idx = {
-    user_id: index
-    for index, user_id in enumerate(user_ids)
-}
-
-item_to_idx = {
-    item_id: index
-    for index, item_id in enumerate(item_ids)
-}
+user_to_idx = {user_id: idx for idx, user_id in enumerate(user_ids)}
+item_to_idx = {item_id: idx for idx, item_id in enumerate(item_ids)}
 
 # TODO: Map the raw IDs inside your interactions dataframe to their respective structural coordinates
 # Hint: Use .map() with your index dictionaries on 'visitorid' and 'itemid' columns to get underlying indices (.values)
 row_idx = interactions['visitorid'].map(user_to_idx).values
 col_idx = interactions['itemid'].map(item_to_idx).values
-data = interactions['weight'].values.astype(np.float32)
+data = interactions['weight'].values
 
 # TODO: Assemble a Compressed Sparse Row (CSR) matrix using your mapped coordinates and weights
 # Hint: Pass a data configuration tuple ((data, (row_idx, col_idx))) alongside explicit shape constraints
 user_item_matrix = sp.csr_matrix(
     (data, (row_idx, col_idx)),
-    shape=(len(user_ids), len(item_ids)),
-    dtype=np.float32
+    shape=(len(user_ids), len(item_ids))
 )
 
 # TODO: Transpose the user_item_matrix and format explicitly as a CSR matrix to facilitate item similarity calculations
 item_user_matrix = user_item_matrix.T.tocsr()
 
-print(f"    User-item matrix shape : {user_item_matrix.shape if user_item_matrix is not None else 'N/A'}")
-print(f"    Non-zero entries       : {user_item_matrix.nnz:,}" if user_item_matrix is not None else "N/A")
+print(f"    User-item matrix shape : {user_item_matrix.shape}")
+print(f"    Non-zero entries       : {user_item_matrix.nnz:,}")
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +99,7 @@ print("\n[3] Computing item-item similarity (batched for memory efficiency)...")
 # Hint: Use sklearn's normalize() function specifying norm='l2'
 item_user_norm = normalize(item_user_matrix, norm='l2', axis=1)
 
-MAX_ITEMS = min(5000, len(item_ids)) if item_ids is not None else 5000
+MAX_ITEMS = min(5000, len(item_ids))
 print(f"    Computing similarity for top {MAX_ITEMS:,} items (by interaction count)...")
 
 # TODO: Identify the top most interacted items to isolate an executable benchmark evaluation boundary
@@ -114,26 +108,10 @@ item_interaction_counts = np.asarray(item_user_matrix.sum(axis=1)).flatten()
 top_item_indices = np.argsort(item_interaction_counts)[::-1][:MAX_ITEMS]
 top_item_ids = item_ids[top_item_indices]
 
-# This map connects a global catalog item matrix index to its row location
-# in the precomputed top-item similarity matrix.
-top_item_position = {
-    item_index: position
-    for position, item_index in enumerate(top_item_indices)
-}
-
 # TODO: Subset your normalized item matrix using top_item_indices and compute the baseline cosine similarity against all item vectors
 # Hint: Call cosine_similarity(item_subset, item_user_norm)
 item_subset = item_user_norm[top_item_indices]
-
-# Keep output sparse. A dense 5,000 × all-items matrix may exceed available RAM.
-similarity_matrix = cosine_similarity(
-    item_subset,
-    item_user_norm,
-    dense_output=False
-).tocsr()
-
-print(f"    Similarity matrix shape: {similarity_matrix.shape}")
-print(f"    Similarity non-zeros   : {similarity_matrix.nnz:,}")
+similarity_matrix = cosine_similarity(item_subset, item_user_norm)
 
 
 # ---------------------------------------------------------------------------
@@ -143,14 +121,13 @@ print("\n[4] Building CF recommendation function...")
 
 def get_cf_recommendations(item_id, top_k=10):
     """
-    Given an item_id, return top_k most similar items based on item-item
-    collaborative filtering.
-
+    Given an item_id, return top_k most similar items based on item-item collaborative filtering.
     Returns a pandas DataFrame tracking 'item_id' and 'similarity'.
     """
+
     # TODO: Check if item_id exists in item_to_idx mapping boundary. If not, return an empty DataFrame.
     if item_id not in item_to_idx:
-        print(f"    Warning: Item ID {item_id} does not exist in the CF catalog.")
+        print(f"    Warning: Item ID {item_id} was not found in the CF catalog.")
         return pd.DataFrame(columns=['item_id', 'similarity'])
 
     item_idx_in_catalog = item_to_idx[item_id]
@@ -158,9 +135,10 @@ def get_cf_recommendations(item_id, top_k=10):
     # TODO: Retrieve the full similarity score array for this item.
     # Logic: If item_id is inside top_item_ids, pull its precomputed vector row from similarity_matrix.
     # Otherwise, fall back to calculating its specific cosine similarity on the fly using item_user_norm.
-    if item_idx_in_catalog in top_item_position:
-        precomputed_row = top_item_position[item_idx_in_catalog]
-        sims = similarity_matrix.getrow(precomputed_row).toarray().flatten()
+    top_position = np.where(top_item_indices == item_idx_in_catalog)[0]
+
+    if len(top_position) > 0:
+        sims = similarity_matrix[top_position[0]].copy()
     else:
         sims = cosine_similarity(
             item_user_norm[item_idx_in_catalog],
@@ -171,17 +149,11 @@ def get_cf_recommendations(item_id, top_k=10):
     sims[item_idx_in_catalog] = -1
 
     # TODO: Discover indices tracking the top_k largest similarity values and build a return DataFrame matching target items
-    valid_count = min(top_k, len(sims) - 1)
-
-    if valid_count <= 0:
-        return pd.DataFrame(columns=['item_id', 'similarity'])
-
-    candidate_indices = np.argpartition(sims, -valid_count)[-valid_count:]
-    top_indices = candidate_indices[np.argsort(sims[candidate_indices])[::-1]]
+    top_indices = np.argsort(sims)[::-1][:top_k]
 
     return pd.DataFrame({
-        'item_id': item_ids[top_indices] if item_ids is not None else [],
-        'similarity': sims[top_indices] if sims is not None else []
+        'item_id': item_ids[top_indices],
+        'similarity': sims[top_indices]
     })
 
 
@@ -190,14 +162,14 @@ def get_cf_recommendations(item_id, top_k=10):
 # ---------------------------------------------------------------------------
 print("\n[5] Testing CF recommender...")
 
-if top_item_ids is not None:
+if len(top_item_ids) > 0:
     popular_item = top_item_ids[0]
     print(f"    Query item ID (most popular): {popular_item}")
 
     # TODO: Run your get_cf_recommendations routine to isolate matching candidate items for popular_item
     cf_recs = get_cf_recommendations(popular_item, top_k=10)
 
-    print(cf_recs.to_string(index=False) if cf_recs is not None else "    Not Implemented")
+    print(cf_recs.to_string(index=False))
 
 
 # ---------------------------------------------------------------------------
@@ -213,21 +185,22 @@ try:
     cb_precision = cb_artifacts['cb_results']['precision_at_10']
     print(f"    CB Precision@10 (Lab 2.1): {cb_precision:.4f}")
 
-except Exception:
+except FileNotFoundError:
     cb_precision = None
     print("    CB artifacts not found — run Lab 2.1 first")
 
 # TODO: Isolate transactional events to verify retrieval scores across users with multiple purchases
 # Filter events down to 'transaction' values and subset column structures to ['visitorid', 'itemid']
 purchases = (
-    events[events['event'] == 'transaction']
-    .sort_values('timestamp')
-    [['visitorid', 'itemid']]
+    events.loc[
+        events['event'] == 'transaction',
+        ['visitorid', 'itemid', 'timestamp']
+    ]
+    .sort_values(['visitorid', 'timestamp'])
     .copy()
 )
 
-if purchases is not None:
-    purchases.columns = ['user_id', 'item_id']
+purchases.columns = ['user_id', 'item_id', 'timestamp']
 
 # TODO: Isolate sequential multi-purchase records by keeping users with 2 or more historical purchases
 multi_buyers = purchases[
@@ -237,11 +210,14 @@ multi_buyers = purchases[
 cf_hits = 0
 cf_total = 0
 
-if multi_buyers is not None:
+if len(multi_buyers) > 0:
     eval_users = multi_buyers['user_id'].unique()[:500]
 
     for user in eval_users:
-        user_items = purchases[purchases['user_id'] == user]['item_id'].values
+        user_items = purchases[
+            purchases['user_id'] == user
+        ]['item_id'].values
+
         catalog_items = [item for item in user_items if item in item_to_idx]
 
         if len(catalog_items) < 2:
@@ -270,11 +246,27 @@ print(f"\n    Evaluated on {cf_total} users")
 print(f"    CF Hits@10     : {cf_hits}")
 print(f"    CF Precision@10: {cf_precision:.4f}")
 
+if cb_precision is not None:
+    difference = cf_precision - cb_precision
+    print(f"    CF vs CB difference: {difference:+.4f}")
+
 
 # ---------------------------------------------------------------------------
 # SECTION 7: Sparsity Problem Visualization
 # ---------------------------------------------------------------------------
 print("\n[7] Visualizing the sparsity problem...")
+
+os.makedirs("output", exist_ok=True)
+
+# Item interaction totals: number of recorded interactions for each item
+item_interaction_frequencies = np.asarray(
+    user_item_matrix.sum(axis=0)
+).flatten()
+
+# User interaction totals: number of recorded interactions for each user
+user_interaction_frequencies = np.asarray(
+    user_item_matrix.sum(axis=1)
+).flatten()
 
 # --- Rendering Long Tail Distributions ---
 fig, axes = plt.subplots(1, 2, figsize=(14, 5))
@@ -286,30 +278,26 @@ fig.suptitle(
 
 # TODO: Plot an item interaction frequency distribution histogram using axes[0] on a logarithmic scale
 # Hint: Use axes[0].hist() and configure axes[0].set_yscale('log') or set log=True
-item_counts = interactions.groupby('itemid')['weight'].sum()
-
 axes[0].hist(
-    item_counts,
+    item_interaction_frequencies,
     bins=50,
     color='#4C72B0',
-    edgecolor='white',
-    log=True
+    edgecolor='white'
 )
+axes[0].set_yscale('log')
 
 axes[0].set_title("Item Interaction Count Distribution\n(log scale — power law)")
 axes[0].set_xlabel("Number of Interactions per Item")
 axes[0].set_ylabel("Number of Items (log)")
 
 # TODO: Plot user interaction frequency distribution counts using a log histogram format on axes[1]
-user_counts = interactions.groupby('visitorid')['weight'].sum()
-
 axes[1].hist(
-    user_counts,
+    user_interaction_frequencies,
     bins=50,
     color='#DD8452',
-    edgecolor='white',
-    log=True
+    edgecolor='white'
 )
+axes[1].set_yscale('log')
 
 axes[1].set_title("User Interaction Count Distribution\n(log scale — power law)")
 axes[1].set_xlabel("Number of Interactions per User")
@@ -325,28 +313,30 @@ plt.show()
 # ---------------------------------------------------------------------------
 # TODO: Dump your sparse matrix definitions, catalog arrays, index mappings, and calculated metrics to a pickle file
 # Path: "data/cf_artifacts.pkl"
+
 cf_artifacts = {
     'user_item_matrix': user_item_matrix,
-    'item_user_matrix': item_user_matrix,
-    'item_user_norm': item_user_norm,
     'user_ids': user_ids,
     'item_ids': item_ids,
     'user_to_idx': user_to_idx,
     'item_to_idx': item_to_idx,
     'top_item_indices': top_item_indices,
     'top_item_ids': top_item_ids,
-    'top_item_position': top_item_position,
     'cf_results': {
         'model': 'Item-Item Collaborative Filtering',
         'precision_at_10': cf_precision,
         'evaluated_users': cf_total,
         'hits_at_10': cf_hits,
-        'cb_precision_at_10': cb_precision
+        'max_precomputed_items': MAX_ITEMS
     }
 }
 
-with open("data/cf_artifacts.pkl", "wb") as f:
-    pickle.dump(cf_artifacts, f)
+with open("data/cf_artifacts.pkl", "wb") as file:
+    pickle.dump(
+        cf_artifacts,
+        file,
+        protocol=pickle.HIGHEST_PROTOCOL
+    )
 
 print("\n    Saved -> data/cf_artifacts.pkl")
 print("    Move to: 03_lightfm_cold_start.py")
